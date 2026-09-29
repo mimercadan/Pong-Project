@@ -1,0 +1,5 @@
+server/server
+*.o
+*.log
+.DS_Store
+__pycache__/
