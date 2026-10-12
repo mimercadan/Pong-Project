@@ -1,6 +1,12 @@
 #ifndef GAME_H
 #define GAME_H
 #define BALL_RADIUS 10.0f
+#define PADDLE_WIDTH 20.0f
+#define PADDLE_MARGIN 30.0f
+
+#define PADDLE_LEFT_X PADDLE_MARGIN
+#define PADDLE_RIGHT_X (GAME_WIDTH - PADDLE_MARGIN - PADDLE_WIDTH)
+#define WINNING_SCORE 5
 
 typedef enum {
     GAME_WAITING,
@@ -24,6 +30,7 @@ typedef struct {
 
     int score_left;
     int score_right;
+    int winner_id; /* 0 significa que todavía no hay ganador. */
 
     game_status_t status;
 } game_t;
@@ -46,5 +53,7 @@ int game_move_paddle(game_t *game, int player_id,
                      move_direction_t direction, float dt);
 
 int game_update(game_t *game, float dt);
+
+int game_forfeit(game_t *game, int player_id);
 
 #endif
