@@ -1,6 +1,6 @@
 CC      = gcc
 CFLAGS  = -Wall -Wextra -pthread -g
-SRC     = src/server.c src/logger.c
+SRC     = src/server.c src/logger.c src/net.c
 OBJ     = $(SRC:.c=.o)
 
 server: $(OBJ)
