@@ -9,7 +9,12 @@
 typedef struct {
     int active;
     game_t game;
-} match_slot_t;
+
+    move_direction_t left_direction;
+    move_direction_t right_direction;
+
+    int worker_running;
+ } match_slot_t;
 
 typedef struct {
     int waiting_ids[PLAYER_CAPACITY];
