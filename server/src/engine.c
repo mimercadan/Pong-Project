@@ -238,3 +238,42 @@ int engine_step_match(
 
     return result;
 }
+
+/* Liberar una partida finalizada cuando su ciclo ya no está activo. */
+int engine_finish_match(
+    engine_t *engine,
+    int match_id,
+    game_t *out_result
+) {
+    if (engine == NULL || out_result == NULL || match_id <= 0) {
+        return -1;
+    }
+
+    int result = -1;
+
+    pthread_mutex_lock(&engine->lock);
+
+    for (int i = 0; i < MATCH_CAPACITY; i++) {
+        match_slot_t *slot = &engine->lobby.matches[i];
+
+        if (!slot->active || slot->game.id != match_id) {
+            continue;
+        }
+
+        /* Esperar a que el ciclo deje de utilizar esta partida. */
+        if (!slot->worker_running) {
+            result = lobby_finish_match(
+                &engine->lobby,
+                &engine->registry,
+                match_id,
+                out_result
+            );
+        }
+
+        break;
+    }
+
+    pthread_mutex_unlock(&engine->lock);
+
+    return result;
+}

@@ -57,4 +57,10 @@ int engine_step_match(
     game_t *out_game
 );
 
+int engine_finish_match(
+    engine_t *engine,
+    int match_id,
+    game_t *out_result
+);
+
 #endif
