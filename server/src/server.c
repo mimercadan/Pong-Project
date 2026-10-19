@@ -6,10 +6,11 @@
 #include <pthread.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include "logger.h"
+#include "net.h"
 
 #define MAX_CLIENTS 64
-#define BUF_SIZE    1024
 
 typedef struct {
     int  fd;
@@ -47,23 +48,27 @@ static void remove_client(client_t *c) {
 /* Un hilo por cliente */
 static void *client_thread(void *arg) {
     client_t *c = arg;
-    unsigned char buf[BUF_SIZE];
-    ssize_t n;
+    msg_header_t h;
+    uint8_t payload[MAX_PAYLOAD];
+    int r;
 
     log_msg("INFO", "Cliente #%d conectado desde %s:%d", c->id, c->ip, c->port);
 
-    while ((n = recv(c->fd, buf, sizeof buf, 0)) > 0) {
-        log_msg("RECV", "Cliente #%d -> %zd bytes", c->id, n);
+    /* Si en 30 s no llega nada, recv falla y se cierra la conexión */
+    struct timeval tv = { .tv_sec = 30, .tv_usec = 0 };
+    setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
 
-        /* TODO: aquí va el parseo del protocolo (lo entrega la persona 3)
-           y el llamado a la lógica del juego (persona 2).
-           Por ahora hace eco para poder probar. */
-        send(c->fd, buf, n, 0);
-        log_msg("SEND", "Cliente #%d <- %zd bytes", c->id, n);
+    while ((r = recv_message(c->fd, &h, payload)) == 1) {
+        log_msg("RECV", "Cliente #%d -> tipo=%u len=%u", c->id, h.type, h.length);
+
+        /* TODO: aquí se llama a la lógica según h.type (persona 2 y 3).
+           Por ahora responde el mismo mensaje (eco) para probar. */
+        if (send_message(c->fd, h.type, payload, h.length) < 0) break;
+        log_msg("SEND", "Cliente #%d <- tipo=%u len=%u", c->id, h.type, h.length);
     }
 
-    if (n == 0) log_msg("INFO",  "Cliente #%d se desconectó", c->id);
-    else        log_msg("ERROR", "Cliente #%d error en recv", c->id);
+    if (r == 0) log_msg("INFO",  "Cliente #%d se desconectó", c->id);
+    else        log_msg("WARN",  "Cliente #%d: mensaje inválido, timeout o error", c->id);
 
     remove_client(c);
     close(c->fd);
