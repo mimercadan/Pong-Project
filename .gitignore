@@ -3,3 +3,5 @@ server/server
 *.log
 .DS_Store
 __pycache__/
+server/build/
+*.d
