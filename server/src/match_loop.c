@@ -4,6 +4,7 @@
 
 #include <errno.h>
 #include <stddef.h>
+#include <stdlib.h>
 #include <time.h>
 
 /* Buscar una partida. Se llama con el mutex adquirido. */
@@ -41,9 +42,14 @@ static void *run_match(void *argument) {
     match_loop_t *loop = argument;
     struct timespec previous;
 
+    /* Una partida independiente no tiene a nadie esperándola con join. */
+    if (loop->self_owned) {
+        pthread_detach(pthread_self());
+    }
+
+    /* Si no se puede leer el reloj, no se entra al ciclo. */
     if (clock_gettime(CLOCK_MONOTONIC, &previous) != 0) {
-        release_worker(loop);
-        return NULL;
+        atomic_store(&loop->stop_requested, 1);
     }
 
     while (!atomic_load(&loop->stop_requested)) {
@@ -105,10 +111,32 @@ static void *run_match(void *argument) {
             break;
         }
 
-        /* Después conectaremos aquí la comunicación del estado. */
+        /* Avisar al servidor para que envíe el estado a los jugadores. */
+        if (loop->on_event != NULL) {
+            loop->on_event(&snapshot, 0);
+        }
     }
 
     release_worker(loop);
+
+    /*
+     * Si la partida terminó por puntos, liberarla y avisar el resultado.
+     * Si un jugador se desconectó, engine_disconnect ya la liberó;
+     * entonces engine_finish_match falla y no se avisa dos veces.
+     */
+    if (loop->on_event != NULL) {
+        game_t result;
+
+        if (engine_finish_match(loop->engine, loop->match_id, &result) == 0) {
+            loop->on_event(&result, 1);
+        }
+    }
+
+    /* Una partida independiente se borra a sí misma al terminar. */
+    if (loop->self_owned) {
+        free(loop);
+    }
+
     return NULL;
 }
 
@@ -167,5 +195,28 @@ int match_loop_stop(match_loop_t *loop) {
     }
 
     loop->started = 0;
+    return 0;
+}
+
+int match_loop_run_detached(
+    engine_t *engine,
+    int match_id,
+    match_event_fn on_event
+) {
+    match_loop_t *loop = calloc(1, sizeof *loop);
+
+    if (loop == NULL) {
+        return -1;
+    }
+
+    loop->on_event = on_event;
+    loop->self_owned = 1;
+
+    if (match_loop_start(loop, engine, match_id) != 0) {
+        free(loop);
+        return -1;
+    }
+
+    /* Desde aquí no se toca loop: el hilo lo libera al terminar. */
     return 0;
 }
