@@ -25,7 +25,7 @@ La implementación se organiza en los siguientes módulos:
 
 | Archivo o módulo | Responsabilidad |
 |---|---|
-| `server/src/server.c` | Aceptar conexiones y atender los mensajes de cada cliente. |
+| `server/src/server.c` | Aceptar conexiones, atender los mensajes de cada cliente y enviar estados y resultados de las partidas. |
 | `server/src/net.h` y `net.c` | Enviar y recibir mensajes completos sobre TCP. |
 | `server/src/logger.h` y `logger.c` | Registrar eventos en consola y archivo. |
 | `server/src/protocol.h` y `protocol.c` | Interpretar y construir los payloads binarios. |
@@ -36,14 +36,49 @@ La implementación se organiza en los siguientes módulos:
 | `server/src/match_loop.h` y `match_loop.c` | Administrar el hilo de actualización de cada partida. |
 | `client/protocol.py` | Implementar el protocolo binario en Python. |
 | `client/pong_client.py` | Conexión, teclado y representación gráfica del juego. |
+| `tests/bots.py` | Jugadores simulados para probar varias partidas simultáneas contra el servidor. |
 
 #### Estado actual de integración
 
-Los módulos de red, lógica y protocolo están reunidos y se compilan en el mismo ejecutable. Pasan las seis pruebas en C y las 13 pruebas del protocolo en Python.
+Los módulos de red, lógica y protocolo están integrados en el mismo ejecutable. El servidor atiende el ciclo completo de una partida: registro, cola de espera, emparejamiento, movimientos, envío del estado, fin por puntos y fin por abandono.
 
-En esta versión, `server.c` todavía responde mediante eco. Está pendiente conectar los mensajes con el registro, el lobby, las entradas, el inicio de los ciclos y el envío de estados y resultados.
+Se probó con el cliente pygame real y con jugadores simulados (`tests/bots.py`) jugando hasta 10 partidas al mismo tiempo. Los resultados están en la sección [Pruebas](#pruebas).
 
-También están pendientes las pruebas completas del cliente contra el servidor real en C y la validación del despliegue en AWS. El servidor de práctica en Python no sustituye estos pasos.
+#### Hilos del servidor
+
+El servidor usa dos tipos de hilos:
+
+| Hilo | Cuántos hay | Qué hace |
+|---|---|---|
+| Hilo principal (`main`) | 1 | Espera conexiones con `accept` y crea un hilo por cliente. |
+| Hilo de cliente (`client_thread`) | 1 por conexión | Lee los mensajes de su cliente y los atiende según el tipo. |
+| Hilo de partida (`run_match` en `match_loop.c`) | 1 por partida | Avanza la física cada ~16 ms y envía `STATE` a los dos jugadores. |
+
+Cuando el segundo jugador envía `JOIN`, su hilo de cliente envía `MATCH_START` a los dos y arranca el hilo de la partida. Ese hilo llama a `on_match_event` (en `server.c`) después de cada paso para enviar el estado. Cuando alguien llega a 5 puntos, el hilo libera la partida en el motor y luego envía `GAME_OVER`. Así los jugadores ya pueden enviar `JOIN` otra vez cuando reciben el resultado.
+
+#### Cómo responde el servidor a cada mensaje
+
+| Mensaje recibido | Condición | Respuesta |
+|---|---|---|
+| `REGISTER` | Datos válidos | `REGISTER_RESULT` con resultado OK y el id del jugador |
+| `REGISTER` | Datos inválidos o conexión ya registrada | `REGISTER_RESULT` con el código del problema |
+| `JOIN` | No hay nadie esperando | `WAITING` |
+| `JOIN` | Hay un rival esperando | `MATCH_START` a los dos jugadores y luego `STATE` ~60 veces por segundo |
+| `JOIN` | Sin registro / ya esperando o jugando | `ERROR` 2 / `ERROR` 3 |
+| `MOVE` | En partida | Ninguna: el cambio se ve en el siguiente `STATE` |
+| `MOVE` | Sin registro / sin partida / dirección inválida | `ERROR` 2 / `ERROR` 3 / `ERROR` 1 |
+| `PING` | Siempre | Ninguna: solo evita el cierre por inactividad |
+| `QUIT` o desconexión | Estaba jugando | El rival recibe `GAME_OVER` con motivo abandono |
+| Tipo desconocido o payload mal formado | — | `ERROR` 1 |
+| Versión o longitud de encabezado inválida | — | Se cierra la conexión |
+
+#### Envíos desde varios hilos
+
+Al socket de un jugador pueden escribir dos hilos: el suyo (respuestas como `WAITING`) y el de su partida (`STATE`). Si escribieran al mismo tiempo, los bytes de los dos mensajes podrían mezclarse. Por eso cada cliente tiene un mutex `send_lock` y todos los envíos pasan por `send_to_client`.
+
+Para enviar a otro jugador se usa `send_to_player(id, ...)`, que busca al cliente en la lista mientras tiene el mutex `clients_lock`. Así el cliente no puede borrarse mientras se le está enviando. Cada socket tiene un tiempo límite de envío de 2 segundos (`SO_SNDTIMEO`) para que un cliente que no lee no bloquee al servidor.
+
+Al desconectarse, el cliente primero se retira de la lista y después se resuelve su partida. De esta forma el hilo de la partida ya no le envía nada y el rival recibe un solo `GAME_OVER`.
 
 ### Protocolo: MyAppGameProtocol
 
@@ -317,7 +352,7 @@ Las consultas entregan copias del estado. Los consumidores no deben conservar pu
 
 Todos los accesos concurrentes deben respetar las funciones del motor y su bloqueo. El mutex no protege accesos directos que ignoren esta regla.
 
-Las esperas se realizan fuera del bloqueo. Los envíos de red también deberán realizarse fuera del mutex del motor.
+Las esperas se realizan fuera del bloqueo. Los envíos de red también se realizan fuera del mutex del motor: primero se obtiene una copia del estado y después se envía.
 
 Los hilos buscan su partida por ID. Si se elimina y el espacio se reutiliza con otro ID, el hilo antiguo no actualiza la nueva partida.
 
@@ -345,6 +380,8 @@ Detener el hilo mediante `match_loop_stop` no finaliza por sí solo la partida: 
 En el cierre normal por puntuación se recoge el hilo antes de liberar la partida. En una desconexión, el motor puede retirarla bajo el mutex; el hilo asociado debe recogerse igualmente.
 
 El motor y las variables de control deben permanecer válidos mientras los hilos los utilicen. El motor se destruye después de recoger todos sus hilos.
+
+El servidor no usa `match_loop_start`/`match_loop_stop` directamente, sino `match_loop_run_detached`. Esta función crea el hilo de la partida como independiente (`pthread_detach`): nadie lo espera con `join`. Cuando la partida termina por puntos, el mismo hilo la libera con `engine_finish_match`, avisa el resultado con `on_match_event` y borra su propia memoria. Si la partida terminó por una desconexión, `engine_disconnect` ya la liberó, `engine_finish_match` falla y el hilo termina sin enviar un segundo `GAME_OVER`.
 
 #### Estados del jugador
 
@@ -389,9 +426,7 @@ Los argumentos son el puerto y la ruta del archivo de log. Ejecutándolo desde l
 ./server 5000 pong.log
 ```
 
-El logger escribe eventos en consola y archivo.
-
-En la versión actual, el servidor de red todavía hace eco; estos comandos no implican que la integración del juego esté terminada.
+El logger escribe eventos en consola y archivo: conexiones, registros, mensajes recibidos y enviados, inicio y fin de cada partida y desconexiones. Los mensajes `STATE`, `MOVE` y `PING` no se registran uno por uno porque se envían decenas de veces por segundo y llenarían el archivo.
 
 #### Pruebas
 
@@ -418,7 +453,32 @@ python3 -m unittest discover -s client -p test_protocol.py -v
 
 Las pruebas en C y Python incluyen ejemplos con los mismos bytes esperados para comprobar compatibilidad.
 
-Los escenarios probados no garantizan ausencia de errores en todas las interacciones concurrentes. Faltan las pruebas completas de red con varias parejas y el cliente real.
+#### Pruebas de red con jugadores simulados
+
+`tests/bots.py` crea jugadores falsos que usan el mismo protocolo del cliente (`client/protocol.py`). Cada bot se registra, pide partida, sigue la bola con su paleta y juega hasta recibir `GAME_OVER`. Para que las partidas terminen, cada bot decide al azar (70 %) si defiende cada bola.
+
+Con el servidor corriendo:
+
+```bash
+python3 tests/bots.py localhost 5000 5          # 5 partidas simultáneas
+python3 tests/bots.py localhost 5000 3 --quit   # en cada pareja un jugador abandona
+```
+
+Resultados obtenidos:
+
+| Prueba | Resultado |
+|---|---|
+| 3 partidas simultáneas hasta 5 puntos | 6/6 bots OK, ambos jugadores reciben el mismo `GAME_OVER` |
+| 10 partidas simultáneas (20 jugadores) | 20/20 bots OK en 94 s, sin errores en el log |
+| Abandono a mitad de partida | El rival recibe `GAME_OVER` con motivo abandono |
+| Mensajes fuera de orden o mal formados | `ERROR` con el código correcto; versión inválida cierra la conexión |
+| `JOIN` después de terminar (por puntos o por abandono) | `WAITING`: el jugador puede volver a jugar |
+| Cliente pygame contra el servidor real | Registro, espera, partida y pantalla final correctos |
+| Servidor compilado con ThreadSanitizer (`-fsanitize=thread`) | Sin condiciones de carrera detectadas |
+
+ThreadSanitizer detectó al principio que `localtime` no es seguro con varios hilos. Se cambió por `localtime_r` en el logger.
+
+Estas pruebas no garantizan ausencia de errores en todas las combinaciones posibles, pero cubren los flujos principales del juego con varias partidas a la vez.
 
 Para limpiar archivos generados:
 
@@ -489,31 +549,84 @@ python3 pong_client.py 127.0.0.1 5000 Bob bob@correo.com
 
 ### Despliegue en AWS
 
-Pendiente de realizar y validar con el servidor integrado.
+El servidor se despliega en una instancia EC2 de AWS Academy. Solo el servidor va a AWS; cada jugador ejecuta el cliente en su propio computador.
 
-La documentación final incluirá:
+#### 1. Crear la instancia
 
-- Entorno de la instancia EC2 en AWS Academy.
-- Instalación de dependencias y compilación.
-- Configuración del puerto de juego en el grupo de seguridad.
-- Comando de ejecución y ubicación de logs.
-- Instrucciones de conexión desde los clientes.
-- Resultados de pruebas remotas con varias parejas.
+En AWS Academy: *Start Lab* → *AWS* → *EC2* → *Launch instance*.
 
-No deben publicarse claves privadas, contraseñas ni credenciales de AWS.
+- **AMI:** Ubuntu Server 24.04 LTS.
+- **Tipo:** `t2.micro` (o `t3.micro`).
+- **Key pair:** crear uno nuevo y descargar el archivo `.pem`.
+- **Security group:** permitir SSH (puerto 22) y agregar una regla *Custom TCP* para el puerto del juego (`5000`) con origen `0.0.0.0/0`.
+
+#### 2. Conectarse e instalar
+
+```bash
+chmod 400 pong-key.pem
+ssh -i pong-key.pem ubuntu@<IP_PUBLICA>
+
+sudo apt update && sudo apt install -y build-essential git
+git clone https://github.com/mimercadan/Pong-Project.git
+cd Pong-Project
+make -C server
+make -C server test
+```
+
+Como el repositorio es privado, `git clone` pide usuario de GitHub y un *personal access token* en lugar de la contraseña.
+
+#### 3. Ejecutar el servidor
+
+```bash
+./server/server 5000 pong.log
+```
+
+Para que siga corriendo al cerrar la sesión SSH:
+
+```bash
+nohup ./server/server 5000 pong.log > /dev/null 2>&1 &
+tail -f pong.log        # ver el log en vivo
+pkill -f "server/server" # detener el servidor
+```
+
+#### 4. Conectar los clientes
+
+Desde cada computador:
+
+```bash
+python3 client/pong_client.py <IP_PUBLICA> 5000 Ana ana@correo.com
+```
+
+También se puede probar el servidor remoto con varias parejas simuladas:
+
+```bash
+python3 tests/bots.py <IP_PUBLICA> 5000 5
+```
+
+#### Notas
+
+- La IP pública cambia cada vez que se reinicia el laboratorio de AWS Academy; hay que usar la que aparece en la consola de EC2.
+- Si los clientes no se conectan, revisar primero la regla del puerto 5000 en el *security group*.
+- No deben publicarse claves privadas (`.pem`), contraseñas ni credenciales de AWS.
 
 ## Conclusiones
 
-La etapa implementada separa las reglas del juego, la gestión de jugadores, la concurrencia y la codificación de mensajes.
+Separar el sistema en módulos (red, protocolo, reglas del juego, jugadores, lobby y motor) permitió que cada parte se desarrollara y probara por separado antes de unirlas. Las pruebas unitarias de la lógica y del protocolo detectaron errores antes de la integración, y las pruebas compartidas de bytes entre C y Python aseguraron que cliente y servidor hablaran el mismo idioma.
 
-Las pruebas realizadas comprueban escenarios de física, gestión de partidas, sincronización y compatibilidad binaria. La validación completa del sistema requiere terminar la integración de red, probar el cliente contra el servidor en C y verificar el despliegue remoto.
+Tener al servidor como única autoridad del juego simplifica la consistencia: los clientes solo envían intenciones (`MOVE`) y dibujan el estado que reciben, por lo que ninguno puede hacer trampa ni quedar desincronizado.
 
-Esta sección se actualizará con los resultados finales de esas pruebas.
+Usar solo TCP hizo más sencilla la implementación, porque los mensajes llegan completos y en orden. El costo es que TCP no conserva los límites de los mensajes; se resolvió con un encabezado de longitud fija y funciones que leen hasta completar cada mensaje.
+
+La parte más delicada fue la concurrencia. Con un hilo por cliente y otro por partida, varios hilos acceden a los mismos datos y escriben en los mismos sockets. Se resolvió con un mutex en el motor, un mutex de envío por cliente y la regla de no enviar por la red mientras se tiene el mutex del motor. Las pruebas con varias partidas simultáneas y ThreadSanitizer ayudaron a confirmar el diseño e incluso encontraron un error en el logger (`localtime` en lugar de `localtime_r`).
 
 ## Referencias
 
 - Enunciado del proyecto Pong — Internet: Arquitectura y Protocolos, EAFIT.
 - Beej’s Guide to C Programming: https://beej.us/guide/bgc/
 - Beej’s Guide to Network Programming: https://beej.us/guide/bgnet/
-- Documentación de Python: https://docs.python.org/3/
+- GeeksforGeeks, TCP Server-Client implementation in C: https://www.geeksforgeeks.org/tcp-server-client-implementation-in-c/
+- POSIX Threads (`pthreads`): https://man7.org/linux/man-pages/man7/pthreads.7.html
+- ThreadSanitizer: https://clang.llvm.org/docs/ThreadSanitizer.html
 - Documentación de pygame: https://www.pygame.org/docs/
+- AWS, Amazon EC2 User Guide: https://docs.aws.amazon.com/ec2/
+- Documentación de Python: https://docs.python.org/3/
