@@ -9,6 +9,11 @@
 #include <sys/time.h>
 #include "logger.h"
 #include "net.h"
+#include "engine.h"
+#include "protocol.h"
+
+/* Un motor compartido por los hilos del servidor. */
+static engine_t engine;
 
 #define MAX_CLIENTS 64
 
@@ -45,34 +50,93 @@ static void remove_client(client_t *c) {
     pthread_mutex_unlock(&clients_lock);
 }
 
-/* Un hilo por cliente */
+/* Un hilo por cliente: primera etapa de integración del protocolo. */
 static void *client_thread(void *arg) {
     client_t *c = arg;
     msg_header_t h;
+
     uint8_t payload[MAX_PAYLOAD];
+    uint8_t response[MAX_PAYLOAD];
     int r;
 
-    log_msg("INFO", "Cliente #%d conectado desde %s:%d", c->id, c->ip, c->port);
+    log_msg("INFO", "Cliente #%d conectado desde %s:%d",
+            c->id, c->ip, c->port);
 
-    /* Si en 30 s no llega nada, recv falla y se cierra la conexión */
-    struct timeval tv = { .tv_sec = 30, .tv_usec = 0 };
+    struct timeval tv = {
+        .tv_sec = 30,
+        .tv_usec = 0
+    };
+
     setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
 
     while ((r = recv_message(c->fd, &h, payload)) == 1) {
-        log_msg("RECV", "Cliente #%d -> tipo=%u len=%u", c->id, h.type, h.length);
+        log_msg("RECV", "Cliente #%d -> %s len=%u",
+                c->id, proto_type_name(h.type), h.length);
 
-        /* TODO: aquí se llama a la lógica según h.type (persona 2 y 3).
-           Por ahora responde el mismo mensaje (eco) para probar. */
-        if (send_message(c->fd, h.type, payload, h.length) < 0) break;
-        log_msg("SEND", "Cliente #%d <- tipo=%u len=%u", c->id, h.type, h.length);
+        int len;
+        uint8_t response_type;
+
+        if (h.type == MSG_REGISTER) {
+            char nickname[PLAYER_NICKNAME_MAX + 1];
+            char email[PLAYER_EMAIL_MAX + 1];
+
+            if (proto_parse_register(
+                payload, h.length, nickname, email
+            ) != 0) {
+                response_type = MSG_ERROR;
+                len = proto_build_error(
+                    response, PROTO_ERR_BAD_MESSAGE
+                );
+            } else {
+                player_result_t result = engine_register(
+                    &engine, c->id, nickname, email
+                );
+
+                response_type = MSG_REGISTER_RESULT;
+
+                len = proto_build_register_result(
+                    response, result, c->id
+                );
+            }
+        } else if (h.type == MSG_PING && h.length == 0) {
+            /* Mantener la conexión sin responder al PING. */
+            continue;
+        } else if (h.type == MSG_QUIT && h.length == 0) {
+            break;
+        } else {
+            /*
+             * JOIN y MOVE se conectarán en la siguiente etapa.
+             * Por ahora se rechazan los mensajes no implementados.
+             */
+            response_type = MSG_ERROR;
+            len = proto_build_error(
+                response, PROTO_ERR_BAD_MESSAGE
+            );
+        }
+
+        if (len < 0 || send_message(
+            c->fd,
+            response_type,
+            response,
+            (uint16_t)len
+        ) != 0) {
+            break;
+        }
+
+        log_msg("SEND", "Cliente #%d <- %s len=%d",
+                c->id, proto_type_name(response_type), len);
     }
 
-    if (r == 0) log_msg("INFO",  "Cliente #%d se desconectó", c->id);
-    else        log_msg("WARN",  "Cliente #%d: mensaje inválido, timeout o error", c->id);
+    /* Retirar el perfil si la conexión llegó a registrarse. */
+    game_t result;
+    engine_disconnect(&engine, c->id, &result);
+
+    log_msg("INFO", "Cliente #%d: conexión terminada", c->id);
 
     remove_client(c);
     close(c->fd);
     free(c);
+
     return NULL;
 }
 
@@ -81,6 +145,11 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Uso: %s <PORT> <LogFile>\n", argv[0]);
         return 1;
     }
+
+    if (engine_init(&engine) != 0) {
+    fprintf(stderr, "No se pudo inicializar el motor\n");
+    return 1;
+ }
     int port = atoi(argv[1]);
 
     if (logger_init(argv[2]) < 0) {
