@@ -5,7 +5,25 @@ Internet: Arquitectura y Protocolos — EAFIT
 ### Integrantes
 - leidy Gallo
 - leidy Dayhana Roldan
-- Migue Mercado
+- Miguel Mercado
+
+### Ejecución rápida
+
+Servidor (Linux, en AWS o local):
+
+```bash
+make -C server
+./server/server 5000 pong.log
+```
+
+Cliente (en cada computador, requiere Python 3 y pygame):
+
+```bash
+pip3 install -r client/requirements.txt
+python3 client/pong_client.py <IP_DEL_SERVIDOR> 5000 <nickname> <email>
+```
+
+Controles: flechas ↑ ↓ (o W/S) para mover la paleta, ESPACIO para jugar otra vez, ESC para salir. Los pasos completos de despliegue están en [Despliegue en AWS](#despliegue-en-aws).
 
 ## Introducción
 
@@ -426,7 +444,24 @@ Los argumentos son el puerto y la ruta del archivo de log. Ejecutándolo desde l
 ./server 5000 pong.log
 ```
 
-El logger escribe eventos en consola y archivo: conexiones, registros, mensajes recibidos y enviados, inicio y fin de cada partida y desconexiones. Los mensajes `STATE`, `MOVE` y `PING` no se registran uno por uno porque se envían decenas de veces por segundo y llenarían el archivo.
+El logger escribe cada evento en consola y en el archivo de log, con fecha y hora:
+
+- Conexiones, desconexiones y timeouts.
+- Cada mensaje recibido (`RECV`), incluidos todos los `MOVE` con su dirección y los `PING`.
+- Cada respuesta enviada (`SEND`): `REGISTER_RESULT`, `WAITING`, `MATCH_START`, `ERROR` y `GAME_OVER`.
+- Registros de jugadores, inicio de partidas, cada punto anotado y el resultado final.
+- El estado de cada partida (`STATE`): el servidor lo envía unas 60 veces por segundo a cada jugador; en el log se registra un resumen por segundo con la posición de la bola, las paletas y el marcador, para que el archivo se pueda leer.
+
+Ejemplo:
+
+```text
+[2026-10-21 18:23:01] [INFO] Partida #1 iniciada: "bot1" (#1) vs "bot2" (#2)
+[2026-10-21 18:23:01] [RECV] Cliente #2 -> MOVE abajo
+[2026-10-21 18:23:02] [SEND] Partida #1 -> STATE a #1 y #2: bola=(696,448) paletas=(250,386) marcador 0-0
+[2026-10-21 18:23:16] [INFO] Partida #1: punto, marcador 1-0
+[2026-10-21 18:24:15] [SEND] Cliente #1 <- GAME_OVER len=7
+[2026-10-21 18:24:15] [INFO] Partida #1 terminada 5-3, ganador jugador #1 (por puntos)
+```
 
 #### Pruebas
 
@@ -602,6 +637,10 @@ También se puede probar el servidor remoto con varias parejas simuladas:
 ```bash
 python3 tests/bots.py <IP_PUBLICA> 5000 5
 ```
+
+#### Validación del despliegue
+
+El servidor se desplegó en una instancia EC2 `t3.micro` con Ubuntu Server 26.04 en AWS Academy (región us-east-1), con el puerto 5000 abierto en el *security group*. Desde computadores externos se probaron los bots y el cliente pygame contra la IP pública de la instancia, con partidas completas funcionando correctamente.
 
 #### Notas
 
