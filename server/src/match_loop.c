@@ -41,6 +41,8 @@ static void release_worker(match_loop_t *loop) {
 static void *run_match(void *argument) {
     match_loop_t *loop = argument;
     struct timespec previous;
+    unsigned long tick = 0;
+    int last_points = 0;   /* para saber cuándo alguien anotó */
 
     /* Una partida independiente no tiene a nadie esperándola con join. */
     if (loop->self_owned) {
@@ -113,7 +115,15 @@ static void *run_match(void *argument) {
 
         /* Avisar al servidor para que envíe el estado a los jugadores. */
         if (loop->on_event != NULL) {
-            loop->on_event(&snapshot, 0);
+            int points = snapshot.score_left + snapshot.score_right;
+            match_event_t event = MATCH_EVENT_TICK;
+
+            if (points != last_points) {
+                event = MATCH_EVENT_POINT;
+                last_points = points;
+            }
+
+            loop->on_event(&snapshot, event, ++tick);
         }
     }
 
@@ -128,7 +138,7 @@ static void *run_match(void *argument) {
         game_t result;
 
         if (engine_finish_match(loop->engine, loop->match_id, &result) == 0) {
-            loop->on_event(&result, 1);
+            loop->on_event(&result, MATCH_EVENT_OVER, ++tick);
         }
     }
 

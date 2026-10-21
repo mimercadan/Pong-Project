@@ -4,12 +4,20 @@
 #include <stdatomic.h>
 #include "engine.h"
 
+/* Qué pasó en la partida en este paso. */
+typedef enum {
+    MATCH_EVENT_TICK,   /* la bola avanzó, no hubo punto */
+    MATCH_EVENT_POINT,  /* alguien anotó y la partida sigue */
+    MATCH_EVENT_OVER    /* la partida terminó por puntos */
+} match_event_t;
+
 /*
- * Función que el ciclo llama para avisar qué pasó en la partida.
- * game_over vale 0 mientras se juega y 1 cuando la partida terminó.
+ * Función que el ciclo llama después de cada paso de la partida.
+ * tick cuenta los pasos desde que empezó (~60 por segundo).
  * El servidor la usa para enviar STATE y GAME_OVER a los jugadores.
  */
-typedef void (*match_event_fn)(const game_t *game, int game_over);
+typedef void (*match_event_fn)(const game_t *game, match_event_t event,
+                               unsigned long tick);
 
 typedef struct {
     engine_t *engine;

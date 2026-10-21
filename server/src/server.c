@@ -31,6 +31,7 @@
 #define MAX_CLIENTS 64
 #define IDLE_TIMEOUT_SECONDS 30
 #define SEND_TIMEOUT_SECONDS 2
+#define STATE_LOG_EVERY 60      /* registrar un STATE por segundo por partida */
 
 /* Un solo motor de juego compartido por todos los hilos. */
 static engine_t engine;
@@ -87,7 +88,7 @@ static int send_to_client(client_t *c, uint8_t type,
     int result = send_message(c->fd, type, payload, (uint16_t)len);
     pthread_mutex_unlock(&c->send_lock);
 
-    /* STATE sale 60 veces por segundo: no se registra para no llenar el log. */
+    /* STATE sale ~60 veces por segundo: se resume en on_match_event. */
     if (type != MSG_STATE) {
         if (result == 0)
             log_msg("SEND", "Cliente #%d <- %s len=%d", c->id, proto_type_name(type), len);
@@ -133,18 +134,35 @@ static void send_game_over(const game_t *game, uint8_t reason) {
 }
 
 /*
- * La llama el hilo de cada partida (match_loop.c).
- *  - Mientras se juega: envía STATE a los dos jugadores.
- *  - Cuando termina por puntos: envía el último STATE y GAME_OVER.
+ * La llama el hilo de cada partida (match_loop.c) después de cada paso.
+ *  - Siempre: envía STATE a los dos jugadores.
+ *  - Si alguien anotó: lo registra como evento.
+ *  - Si la partida terminó por puntos: envía GAME_OVER.
  */
-static void on_match_event(const game_t *game, int game_over) {
+static void on_match_event(const game_t *game, match_event_t event,
+                           unsigned long tick) {
     uint8_t payload[MAX_PAYLOAD];
     int len = proto_build_state(payload, game);
 
     send_to_player(game->player_left_id, MSG_STATE, payload, len);
     send_to_player(game->player_right_id, MSG_STATE, payload, len);
 
-    if (game_over) {
+    /* Registrar un STATE por segundo (no 60) para que el log se pueda leer. */
+    if (tick % STATE_LOG_EVERY == 1 || event != MATCH_EVENT_TICK) {
+        log_msg("SEND", "Partida #%d -> STATE a #%d y #%d: bola=(%.0f,%.0f) "
+                "paletas=(%.0f,%.0f) marcador %d-%d",
+                game->id, game->player_left_id, game->player_right_id,
+                game->ball_x, game->ball_y,
+                game->paddle_left_y, game->paddle_right_y,
+                game->score_left, game->score_right);
+    }
+
+    if (event == MATCH_EVENT_POINT) {
+        log_msg("INFO", "Partida #%d: punto, marcador %d-%d",
+                game->id, game->score_left, game->score_right);
+    }
+
+    if (event == MATCH_EVENT_OVER) {
         send_game_over(game, PROTO_END_SCORE);
     }
 }
@@ -247,9 +265,14 @@ static void handle_move(client_t *c, const uint8_t *payload, uint16_t len) {
     move_direction_t direction;
 
     if (proto_parse_move(payload, len, &direction) != 0) {
+        log_msg("RECV", "Cliente #%d -> MOVE inválido", c->id);
         send_error(c, PROTO_ERR_BAD_MESSAGE);
         return;
     }
+
+    log_msg("RECV", "Cliente #%d -> MOVE %s", c->id,
+            direction == MOVE_UP ? "arriba" :
+            direction == MOVE_DOWN ? "abajo" : "detener");
 
     if (engine_set_input(&engine, c->id, direction) != 0) {
         send_error(c, is_registered(c) ? PROTO_ERR_INVALID_STATE
@@ -295,8 +318,8 @@ static void *client_thread(void *arg) {
     setsockopt(c->fd, SOL_SOCKET, SO_SNDTIMEO, &send_timeout, sizeof send_timeout);
 
     while ((r = recv_message(c->fd, &h, payload)) == 1) {
-        /* PING y MOVE son muy frecuentes: no se registran en el log. */
-        if (h.type != MSG_PING && h.type != MSG_MOVE)
+        /* MOVE se registra en handle_move con la dirección. */
+        if (h.type != MSG_MOVE)
             log_msg("RECV", "Cliente #%d -> %s len=%u", c->id, proto_type_name(h.type), h.length);
 
         if (h.type == MSG_QUIT && h.length == 0) {
