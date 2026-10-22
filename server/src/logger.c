@@ -14,8 +14,12 @@ int logger_init(const char *path) {
 
 void log_msg(const char *level, const char *fmt, ...) {
     char when[32];
+    struct tm local;
     time_t now = time(NULL);
-    strftime(when, sizeof when, "%Y-%m-%d %H:%M:%S", localtime(&now));
+
+    /* localtime_r usa la variable local de cada hilo (localtime no es seguro con hilos). */
+    localtime_r(&now, &local);
+    strftime(when, sizeof when, "%Y-%m-%d %H:%M:%S", &local);
 
     pthread_mutex_lock(&log_lock);   /* varios hilos escriben a la vez */
     va_list args;
